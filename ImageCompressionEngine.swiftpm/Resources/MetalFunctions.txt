@@ -1,0 +1,285 @@
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void chromaSubsampleFirst(device float *values   [[buffer(0)]],
+                                 device float *result   [[buffer(1)]],
+                  device const int *segSizP             [[buffer(2)]],
+                  device const int *imgSizeP            [[buffer(3)]],
+                                device const bool *pixelateP  [[buffer(4)]],
+                  uint2 gid                             [[thread_position_in_grid]]) {
+
+    
+    int width = *imgSizeP;
+    int segSize = *segSizP;
+    bool shouldPixelate = *pixelateP;
+    int i = 3 * (gid.y * width + gid.x);
+    
+    float Y  = values[i*segSize + 0];
+    float Cb = values[i*segSize + 1];
+    float Cr = values[i*segSize + 2];
+    
+    for (int y=0; y < segSize; y++) {
+        for (int x=0; x < segSize; x++) {
+            int idx = i*segSize + 3*(y*width + x);
+            
+            if (shouldPixelate) { result[idx + 0] = Y; }
+            else { result[idx + 0] = values[idx + 0]; }
+            result[idx + 1] = Cb;
+            result[idx + 2] = Cr;
+        }
+    }
+}
+
+kernel void chromaSubsampleAvg( device float *values        [[buffer(0)]],
+                                device float *result        [[buffer(1)]],
+                                device const int *segSizP   [[buffer(2)]],
+                                device const int *imgSizeP  [[buffer(3)]],
+                                device const bool *pixelateP  [[buffer(4)]],
+                                uint2 gid                   [[thread_position_in_grid]]) {
+    
+    
+    int width = *imgSizeP;
+    int segSize = *segSizP;
+    int threadwidth = width / segSize;
+    float segmArea = (float)(segSize*segSize);
+    bool shouldPixelate = *pixelateP;
+    int i = gid.y * width + gid.x;
+    
+    if ((int)gid.x >= threadwidth || (int)gid.y >= threadwidth) { return; }
+    
+    float Y = 0;
+    float Cb = 0;
+    float Cr = 0;
+    
+    for (int y=0; y < segSize; y++) {
+        for (int x=0; x < segSize; x++) {
+            int idx = 3 * (i*segSize + (y*width + x));
+            Y  += values[idx + 0];
+            Cb += values[idx + 1];
+            Cr += values[idx + 2];
+        }
+    }
+    
+    for (int y=0; y < segSize; y++) {
+        for (int x=0; x < segSize; x++) {
+            int idx = 3 * (i*segSize + (y*width + x));
+            
+            if (shouldPixelate) { result[idx + 0] = Y / segmArea; }
+            else { result[idx + 0] = values[idx + 0]; }
+            result[idx + 1] = Cb / segmArea;
+            result[idx + 2] = Cr / segmArea;
+        }
+    }
+}
+
+kernel void reconstructSubsampledImage(device float *inputBytes [[buffer(0)]],
+                                       device uint8_t *outputBytes       [[buffer(1)]],
+                                       device float3x3 *conversionPtr       [[buffer(2)]],
+                                       device int *finalChannelsP       [[buffer(3)]],
+                                       uint2 gid2 [[thread_position_in_grid]]) {
+                       
+    uint gid = gid2.x;
+    float3x3 conversion = *conversionPtr;
+    int finChan = *finalChannelsP;
+    
+    int i = 3*gid;
+    
+    float3 ycbcr = float3(inputBytes[i + 0],
+                          inputBytes[i + 1] - 128,
+                          inputBytes[i + 2] - 128);
+    float3 rgb = clamp(conversion*ycbcr, 0, 255);
+    
+    outputBytes[finChan*gid + 0] = (uint8_t)rgb.x;
+    outputBytes[finChan*gid + 1] = (uint8_t)rgb.y;
+    outputBytes[finChan*gid + 2] = (uint8_t)rgb.z;
+    if (finChan == 4) { outputBytes[4*gid + 3] = 255; }
+}
+
+kernel void quantizeImage(device float *bytes [[buffer(0)]],
+                          device float *colormap       [[buffer(1)]],
+                          device int *numColorsP       [[buffer(2)]],
+                          device int *channelsP       [[buffer(3)]],
+                                       uint2 gid2 [[thread_position_in_grid]]) {
+    uint gid = gid2.x;
+    int numColors = *numColorsP;
+    //int channels = *channelsP;
+    int idx = 3 * gid;
+    
+    float2 cbcr = float2(bytes[idx + 1], bytes[idx + 2]);
+    
+    float bestFit = INFINITY;
+    float2 match;
+    for (int ix = 0; ix < numColors; ix++) {
+        int i = 2 * ix;
+        float2 rgbMatch = float2(colormap[i + 0], colormap[i + 1]);
+        
+        float dist = length_squared(cbcr-rgbMatch);
+        if (dist < bestFit) {
+            match = rgbMatch;
+            bestFit = dist;
+        }
+    }
+    
+    bytes[idx + 1] = match.x;
+    bytes[idx + 2] = match.y;
+    
+}
+
+kernel void quantizeImageDither(device float *bytes [[buffer(0)]],
+                          device float *colormap       [[buffer(1)]],
+                          device uint8_t *dithermap       [[buffer(2)]],
+                          device int *dithermapSize     [[buffer(3)]],
+                          device int *imageSize     [[buffer(4)]],
+                          device int *numColorsP       [[buffer(5)]],
+                          device int *channelsP       [[buffer(6)]],
+                                       uint2 gid2 [[thread_position_in_grid]]) {
+    int imgSiz = *imageSize;
+    
+    if ((int)gid2.x > imgSiz || (int)gid2.y > imgSiz) { return; }
+    
+    int gid = (int)gid2.y * imgSiz + (int)gid2.x;
+    int numColors = *numColorsP;
+    int dmapSiz = *dithermapSize;
+    //int channels = *channelsP;
+    int idx = 3 * gid;
+    int dithermapChannels = 1;
+    
+    float r = 255 / ((float)numColors*4);
+    int dmapI = ((gid2.y % dmapSiz) * dmapSiz) + (gid2.x % dmapSiz);
+    float dOff = ((float)dithermap[dithermapChannels*dmapI] - 128) * r;
+    
+    float2 cbcr = float2(bytes[idx + 1] + dOff, bytes[idx + 2] + dOff);
+    
+    float bestFit = INFINITY;
+    float2 match;
+    for (int ix = 0; ix < numColors; ix++) {
+        int i = 2 * ix;
+        
+        float2 rgbMatch = float2(colormap[i + 0], colormap[i + 1]);
+        
+        float dist = length_squared(cbcr-rgbMatch);
+        if (dist < bestFit) {
+            match = rgbMatch;
+            bestFit = dist;
+        }
+    }
+    
+    bytes[idx + 1] = match.x;
+    bytes[idx + 2] = match.y;
+    
+}
+template <class T>
+void copyMemory(device T *dest, device const T *source, int count, int dstOffset=0, int srcOffset=0, int dstStride=1, int srcStride=1) {
+    for (int i = 0; i < count; i++) { dest[i*dstStride + dstOffset] = source[i*srcStride + srcOffset]; }
+}
+
+float dctscale(int k) {
+    if (k == 0) { return M_SQRT1_2_F; }
+    else { return 1.0f; }
+}
+
+void dct(device const float *in,
+         device float *out,
+         device const float *lut,
+         int N,
+         int offset=0,
+         int inStride=1,
+         int outStride=1) {
+    
+    float scale = sqrt(2/ (float)N);
+    for (int k = 0; k < N; k++) {
+        int outIdx = k*outStride;
+        out[outIdx] = 0;
+        for (int n = 0; n < N; n++) {
+            out[outIdx] += in[offset + n*inStride] * lut[k*N + n];
+        }
+        out[outIdx] *= scale * dctscale(k);
+    }
+    
+}
+
+void idct(device const float *in,
+          device float *out,
+          device const float *lut,
+          int N,
+          int offset=0,
+          int inStride=1,
+          int outStride=1) {
+    
+    float scale = sqrt(2/ (float)N);
+    for (int k = 0; k < N; k++) {
+        int outIdx = k*outStride;
+        out[outIdx] = 0;
+        for (int n = 0; n < N; n++) {
+            out[outIdx] += scale * dctscale(n) * in[offset + n*inStride] * lut[n*N + k];
+        }
+    }
+    
+}
+
+kernel void dct2D(device float *values      [[buffer(0)]],
+                  device float *resultBuff  [[buffer(1)]],
+                  device const float *lut   [[buffer(2)]],
+                  device const int *sizeP   [[buffer(3)]],
+                  device const int *imgSizeP[[buffer(4)]],
+                  device const int *threadwidthP [[buffer(5)]],
+                  device const bool *inverse[[buffer(6)]],
+                  uint2 gid                 [[thread_position_in_grid]]) {
+    
+    bool inv = *inverse;
+    int size = *sizeP;
+    int imgSize = *imgSizeP;
+    int threadwidth = *threadwidthP;
+    
+    if ((int)gid.x >= threadwidth || (int)gid.y >= threadwidth) { return; }
+    
+    int resBuffIdx = size * (gid.y*threadwidth + gid.x);
+    int offset = size * ((int)gid.y*imgSize + (int)gid.x);
+    
+    device float *buffPtr = &resultBuff[resBuffIdx];
+    
+    for (int row = 0; row < size; row++) {
+        if (!inv)   { dct(values, buffPtr, lut, size, offset + row*imgSize); }
+        else        { idct(values, buffPtr, lut, size, offset + row*imgSize); }
+        copyMemory(values, buffPtr, size, offset + row*imgSize);
+    }
+    
+    for (int col = 0; col < size; col++) {
+        if (!inv)   { dct(values, buffPtr, lut, size, offset + col, imgSize); }
+        else        { idct(values, buffPtr, lut, size, offset + col, imgSize); }
+        copyMemory(values, buffPtr, size, offset + col, 0, imgSize);
+    }
+    
+}
+
+kernel void dct2DInv(device float *values      [[buffer(0)]],
+                  device float *resultBuff  [[buffer(1)]],
+                  device const float *lut   [[buffer(2)]],
+                  device const int *sizeP   [[buffer(3)]],
+                  device const int *imgSizeP[[buffer(4)]],
+                  device const int *threadwidthP [[buffer(5)]],
+                  device const bool *inverse[[buffer(6)]],
+                  uint2 gid                 [[thread_position_in_grid]]) {
+    
+    int size = *sizeP;
+    int imgSize = *imgSizeP;
+    int threadwidth = *threadwidthP;
+    
+    if ((int)gid.x >= threadwidth || (int)gid.y >= threadwidth) { return; }
+    
+    int resBuffIdx = size * (gid.y*threadwidth + gid.x);
+    int offset = size * ((int)gid.y*imgSize + (int)gid.x);
+    
+    device float *buffPtr = &resultBuff[resBuffIdx];
+    
+    for (int row = 0; row < size; row++) {
+        idct(values, buffPtr, lut, size, offset + row*imgSize);
+        copyMemory(values, buffPtr, size, offset + row*imgSize);
+    }
+    
+    for (int col = 0; col < size; col++) {
+        idct(values, buffPtr, lut, size, offset + col, imgSize);
+        copyMemory(values, buffPtr, size, offset + col, 0, imgSize);
+    }
+    
+}
