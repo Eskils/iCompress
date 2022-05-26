@@ -1,8 +1,8 @@
 # iCompress
 
-![Screenshot of app](./Resources/Skjermbilde%202022-05-26%20kl.%2009.24.06.png)
+![Screenshot of app](./Resources/appMountainLight.png)
 
-An exploration into methods for lossy image compression.  
+An exploration into methods of lossy image compression.  
 My winning Apple WWDC 22 Swift Student Challenge submission.
 
 ## About
